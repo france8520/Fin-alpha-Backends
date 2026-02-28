@@ -9,10 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import numpy as np
-import torch
-import scipy.special
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from functools import lru_cache
+import requests as http_requests
+import os
 import uvicorn
 
 app = FastAPI(title="FinAlpha API", version="1.0.0")
@@ -25,35 +23,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load FinBERT once at startup ──────────────────────────────────────────────
-print("Loading FinBERT model...")
-tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-finbert   = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-finbert.eval()
-print("FinBERT ready.")
+# ── Hugging Face Inference API ────────────────────────────────────────────────
+# ไม่โหลด model ลงเครื่อง — เรียก HF API แทน ประหยัด RAM ไปได้ ~400MB
+HF_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
+HF_TOKEN   = os.environ.get("HF_TOKEN", "")  # ใส่ใน Render Environment Variables
+print("Using Hugging Face Inference API for FinBERT.")
 
 
-# ── Helper: FinBERT sentiment ─────────────────────────────────────────────────
+# ── Helper: FinBERT sentiment via HF Inference API ───────────────────────────
 def get_sentiment(texts: list[str]) -> dict:
-    """รับ list of text → คืน avg pos/neg/neu score และ label"""
+    """เรียก Hugging Face Inference API — ไม่โหลด model ลงเครื่อง"""
     if not texts:
         return {"label": "neutral", "score": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 1.0}
 
     all_scores = {"positive": [], "negative": [], "neutral": []}
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-    with torch.no_grad():
-        for text in texts[:20]:  # จำกัด 20 ข่าวเพื่อความเร็ว
-            inputs  = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-            outputs = finbert(**inputs)
-            probs   = scipy.special.softmax(outputs.logits.numpy().squeeze())
-            labels  = finbert.config.id2label
+    for text in texts[:10]:  # จำกัด 10 ข่าว เพื่อไม่ให้ช้าเกิน
+        try:
+            resp = http_requests.post(
+                HF_API_URL,
+                headers=headers,
+                json={"inputs": text[:512]},
+                timeout=15
+            )
+            if resp.status_code != 200:
+                continue
+            results = resp.json()
+            # HF คืน [[{label, score}, ...]]
+            if isinstance(results, list) and isinstance(results[0], list):
+                results = results[0]
+            for item in results:
+                lbl = item["label"].lower()
+                if lbl in all_scores:
+                    all_scores[lbl].append(float(item["score"]))
+        except Exception:
+            continue
 
-            for idx, prob in enumerate(probs):
-                all_scores[labels[idx]].append(float(prob))
+    if not any(all_scores.values()):
+        return {"label": "neutral", "score": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 1.0}
 
-    avg = {k: float(np.mean(v)) for k, v in all_scores.items()}
+    avg = {k: float(np.mean(v)) if v else 0.0 for k, v in all_scores.items()}
     label = max(avg, key=avg.get)
-    score = avg["positive"] - avg["negative"]  # -1 ถึง +1
+    score = avg["positive"] - avg["negative"]
 
     return {
         "label":    label,
@@ -208,119 +220,3 @@ def analyze(ticker: str):
 
 if __name__ == "__main__":
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
-
-# ── Chart Data Endpoint ───────────────────────────────────────────────────────
-@app.get("/chart/{ticker}")
-def chart(ticker: str, period: str = "1y"):
-    """
-    คืน OHLCV + indicators สำหรับ chart
-    period: 1d, 1wk, 1mo, 3mo, 6mo, 1y, 2y, 5y
-    """
-    import math
-
-    # period -> (yf_period, yf_interval)
-    PERIOD_MAP = {
-        "1d":  ("1d",  "5m"),
-        "1wk": ("5d",  "15m"),
-        "1mo": ("1mo", "1d"),
-        "3mo": ("3mo", "1d"),
-        "6mo": ("6mo", "1d"),
-        "1y":  ("1y",  "1d"),
-        "2y":  ("2y",  "1wk"),
-        "5y":  ("5y",  "1wk"),
-    }
-
-    ticker = ticker.strip().upper()
-    if period not in PERIOD_MAP:
-        period = "1y"
-
-    yf_period, yf_interval = PERIOD_MAP[period]
-
-    try:
-        stock = yf.Ticker(ticker)
-        hist  = stock.history(period=yf_period, interval=yf_interval)
-
-        if hist.empty or len(hist) < 5:
-            raise HTTPException(status_code=404, detail=f"No data for {ticker}")
-
-        # strip timezone safely
-        if hist.index.tz is not None:
-            hist.index = hist.index.tz_convert("UTC").tz_localize(None)
-        else:
-            hist.index = hist.index.tz_localize(None)
-
-        # EMA
-        hist["ema20"] = hist["Close"].ewm(span=20).mean()
-        hist["ema50"] = hist["Close"].ewm(span=50).mean()
-
-        # Bollinger Bands
-        sma20 = hist["Close"].rolling(20).mean()
-        std20 = hist["Close"].rolling(20).std()
-        hist["bb_upper"] = sma20 + 2 * std20
-        hist["bb_lower"] = sma20 - 2 * std20
-        hist["bb_mid"]   = sma20
-
-        # RSI 14
-        delta = hist["Close"].diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        rs    = gain / loss
-        hist["rsi"] = 100 - 100 / (1 + rs)
-
-        # MACD
-        ema12 = hist["Close"].ewm(span=12).mean()
-        ema26 = hist["Close"].ewm(span=26).mean()
-        hist["macd"]        = ema12 - ema26
-        hist["macd_signal"] = hist["macd"].ewm(span=9).mean()
-        hist["macd_hist"]   = hist["macd"] - hist["macd_signal"]
-
-        # Volume SMA
-        hist["vol_sma20"] = hist["Volume"].rolling(20).mean()
-
-        def clean(val):
-            try:
-                f = float(val)
-                return None if math.isnan(f) else round(f, 4)
-            except:
-                return None
-
-        rows = []
-        for date, row in hist.iterrows():
-            rows.append({
-                "date":        int(date.timestamp()) if yf_interval in ("5m","15m","30m","1h") else date.strftime("%Y-%m-%d"),
-                "open":        clean(row["Open"]),
-                "high":        clean(row["High"]),
-                "low":         clean(row["Low"]),
-                "close":       clean(row["Close"]),
-                "volume":      int(row["Volume"]) if not math.isnan(float(row["Volume"])) else 0,
-                "ema20":       clean(row["ema20"]),
-                "ema50":       clean(row["ema50"]),
-                "bb_upper":    clean(row["bb_upper"]),
-                "bb_lower":    clean(row["bb_lower"]),
-                "bb_mid":      clean(row["bb_mid"]),
-                "rsi":         clean(row["rsi"]),
-                "macd":        clean(row["macd"]),
-                "macd_signal": clean(row["macd_signal"]),
-                "macd_hist":   clean(row["macd_hist"]),
-                "vol_sma20":   clean(row["vol_sma20"]),
-            })
-
-        current_price = clean(hist["Close"].iloc[-1])
-        prev_close    = clean(hist["Close"].iloc[-2]) if len(hist) > 1 else current_price
-        change_pct    = round((current_price - prev_close) / prev_close * 100, 2) if prev_close else 0
-
-        return {
-            "ticker":        ticker,
-            "period":        period,
-            "current_price": current_price,
-            "change_pct":    change_pct,
-            "high_52w":      clean(hist["High"].max()),
-            "low_52w":       clean(hist["Low"].min()),
-            "avg_volume":    int(hist["Volume"].mean()),
-            "data":          rows,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
