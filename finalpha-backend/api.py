@@ -214,22 +214,40 @@ if __name__ == "__main__":
 def chart(ticker: str, period: str = "1y"):
     """
     คืน OHLCV + indicators สำหรับ chart
-    period: 1mo, 3mo, 6mo, 1y, 2y, 5y
+    period: 1d, 1wk, 1mo, 3mo, 6mo, 1y, 2y, 5y
     """
     import math
-    VALID_PERIODS = {"1mo", "3mo", "6mo", "1y", "2y", "5y"}
+
+    # period -> (yf_period, yf_interval)
+    PERIOD_MAP = {
+        "1d":  ("1d",  "5m"),
+        "1wk": ("5d",  "15m"),
+        "1mo": ("1mo", "1d"),
+        "3mo": ("3mo", "1d"),
+        "6mo": ("6mo", "1d"),
+        "1y":  ("1y",  "1d"),
+        "2y":  ("2y",  "1wk"),
+        "5y":  ("5y",  "1wk"),
+    }
+
     ticker = ticker.strip().upper()
-    if period not in VALID_PERIODS:
+    if period not in PERIOD_MAP:
         period = "1y"
+
+    yf_period, yf_interval = PERIOD_MAP[period]
 
     try:
         stock = yf.Ticker(ticker)
-        hist  = stock.history(period=period)
+        hist  = stock.history(period=yf_period, interval=yf_interval)
 
         if hist.empty or len(hist) < 5:
             raise HTTPException(status_code=404, detail=f"No data for {ticker}")
 
-        hist.index = hist.index.tz_localize(None)
+        # strip timezone safely
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_convert("UTC").tz_localize(None)
+        else:
+            hist.index = hist.index.tz_localize(None)
 
         # EMA
         hist["ema20"] = hist["Close"].ewm(span=20).mean()
@@ -269,7 +287,7 @@ def chart(ticker: str, period: str = "1y"):
         rows = []
         for date, row in hist.iterrows():
             rows.append({
-                "date":        date.strftime("%Y-%m-%d"),
+                "date":        int(date.timestamp()) if yf_interval in ("5m","15m","30m","1h") else date.strftime("%Y-%m-%d"),
                 "open":        clean(row["Open"]),
                 "high":        clean(row["High"]),
                 "low":         clean(row["Low"]),
