@@ -297,3 +297,101 @@ def analyze(ticker: str):
 
 if __name__ == "__main__":
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
+
+
+# ── Helper: calculate indicators ──────────────────────────────────────────────
+def _ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
+
+def _bollinger(series, n=20, k=2):
+    mid   = series.rolling(n).mean()
+    std   = series.rolling(n).std()
+    return mid + k*std, mid, mid - k*std
+
+def _rsi(series, n=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(n).mean()
+    loss  = (-delta.clip(upper=0)).rolling(n).mean()
+    rs    = gain / loss
+    return 100 - 100 / (1 + rs)
+
+def _macd(series, fast=12, slow=26, signal=9):
+    macd_line   = _ema(series, fast) - _ema(series, slow)
+    signal_line = _ema(macd_line, signal)
+    hist        = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+@app.get("/chart/{ticker}")
+def chart(ticker: str, period: str = "1y"):
+    ticker = ticker.strip().upper()
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    cache_key = f"chart:{ticker}:{period}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        hist = yf_ticker_history(ticker, period=period)
+        if hist.empty or len(hist) < 5:
+            raise ValueError(f"Insufficient data for {ticker}")
+
+        close  = hist["Close"]
+        high   = hist["High"]
+        low    = hist["Low"]
+        volume = hist["Volume"] if "Volume" in hist.columns else None
+
+        ema20 = _ema(close, 20)
+        ema50 = _ema(close, 50)
+        bb_upper, bb_mid, bb_lower = _bollinger(close)
+        rsi_vals = _rsi(close)
+        macd_line, signal_line, macd_hist = _macd(close)
+        vol_sma20 = volume.rolling(20).mean() if volume is not None else None
+
+        rows = []
+        for i, (idx, row) in enumerate(hist.iterrows()):
+            date_str = idx.strftime("%Y-%m-%d")
+            rows.append({
+                "date":       date_str,
+                "open":       round(float(row["Open"]),  4),
+                "high":       round(float(row["High"]),  4),
+                "low":        round(float(row["Low"]),   4),
+                "close":      round(float(row["Close"]), 4),
+                "volume":     int(row["Volume"]) if volume is not None and not np.isnan(row["Volume"]) else 0,
+                "ema20":      round(float(ema20.iloc[i]),    4) if not np.isnan(ema20.iloc[i])    else None,
+                "ema50":      round(float(ema50.iloc[i]),    4) if not np.isnan(ema50.iloc[i])    else None,
+                "bb_upper":   round(float(bb_upper.iloc[i]),4) if not np.isnan(bb_upper.iloc[i]) else None,
+                "bb_mid":     round(float(bb_mid.iloc[i]),  4) if not np.isnan(bb_mid.iloc[i])   else None,
+                "bb_lower":   round(float(bb_lower.iloc[i]),4) if not np.isnan(bb_lower.iloc[i]) else None,
+                "rsi":        round(float(rsi_vals.iloc[i]),2) if not np.isnan(rsi_vals.iloc[i]) else None,
+                "macd":       round(float(macd_line.iloc[i]),4)   if not np.isnan(macd_line.iloc[i])   else None,
+                "macd_signal":round(float(signal_line.iloc[i]),4) if not np.isnan(signal_line.iloc[i]) else None,
+                "macd_hist":  round(float(macd_hist.iloc[i]),4)   if not np.isnan(macd_hist.iloc[i])   else None,
+                "vol_sma20":  round(float(vol_sma20.iloc[i]),2)   if vol_sma20 is not None and not np.isnan(vol_sma20.iloc[i]) else None,
+            })
+
+        current_price = round(float(close.iloc[-1]), 2)
+        prev_close    = round(float(close.iloc[-2]), 2) if len(close) > 1 else current_price
+        change_pct    = round((current_price - prev_close) / prev_close * 100, 2)
+
+        result = {
+            "ticker":        ticker,
+            "period":        period,
+            "current_price": current_price,
+            "change_pct":    change_pct,
+            "high_52w":      round(float(high.max()), 2),
+            "low_52w":       round(float(low.min()),  2),
+            "avg_volume":    int(volume.mean()) if volume is not None else 0,
+            "data":          rows,
+        }
+        cache_set(cache_key, result)
+        return result
+
+    except ValueError as e:
+        logger.error(f"[chart:{ticker}] ValueError: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"[chart:{ticker}] Exception: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chart failed: {str(e)}")
