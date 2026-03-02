@@ -20,10 +20,10 @@ from threading import Lock
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finalpha")
 
-# ── Simple TTL Cache ────────────────────────────────────────────────────────
+# ── Simple TTL Cache ─────────────────────────────────────────────────────────
 _cache: dict = {}
 _cache_lock = Lock()
-CACHE_TTL = 15 * 60  # 15 นาที (วินาที)
+CACHE_TTL = 15 * 60  # 15 นาที
 
 def cache_get(key: str):
     with _cache_lock:
@@ -36,6 +36,49 @@ def cache_get(key: str):
 def cache_set(key: str, data):
     with _cache_lock:
         _cache[key] = {"data": data, "ts": time.time()}
+
+# ── Retry helper สำหรับ yfinance (rate limit / network error) ─────────────────
+def yf_ticker_history(ticker: str, period: str = "1y", retries: int = 3):
+    """ดึง history พร้อม retry backoff เมื่อโดน rate limit"""
+    for attempt in range(retries):
+        try:
+            stock = yf.Ticker(ticker)
+            hist  = stock.history(period=period)
+            if not hist.empty:
+                return hist
+            # hist ว่างแต่ไม่ error — อาจโดน block เงียบๆ
+            raise ValueError(f"Empty data returned for {ticker}")
+        except Exception as e:
+            msg = str(e).lower()
+            is_rate_limit = "too many requests" in msg or "rate limit" in msg or "429" in msg
+            if attempt < retries - 1 and is_rate_limit:
+                wait = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                logger.warning(f"[{ticker}] Rate limited, retry {attempt+1}/{retries} in {wait}s")
+                time.sleep(wait)
+            else:
+                raise
+    raise ValueError(f"Failed to fetch data for {ticker} after {retries} retries")
+
+def yf_spy_returns(retries: int = 3):
+    """ดึง SPY returns พร้อม retry backoff"""
+    cached = cache_get("spy_returns")
+    if cached is not None:
+        return cached
+    for attempt in range(retries):
+        try:
+            spy = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
+            spy.columns = spy.columns.get_level_values(0)
+            ret = spy["Close"].pct_change().dropna()
+            cache_set("spy_returns", ret)
+            return ret
+        except Exception as e:
+            msg = str(e).lower()
+            if attempt < retries - 1 and ("too many requests" in msg or "429" in msg):
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"[SPY] Rate limited, retry {attempt+1}/{retries} in {wait}s")
+                time.sleep(wait)
+            else:
+                return None  # Beta fallback = 1.0
 
 app = FastAPI(title="FinAlpha API", version="1.0.0")
 
@@ -107,8 +150,7 @@ def calc_risk_metrics(ticker: str) -> dict:
     if cached:
         return cached
 
-    stock = yf.Ticker(ticker)
-    hist  = stock.history(period="1y")
+    hist = yf_ticker_history(ticker)  # retry built-in
     logger.info(f"[{ticker}] history rows: {len(hist)}")
 
     if hist.empty or len(hist) < 20:
@@ -119,19 +161,15 @@ def calc_risk_metrics(ticker: str) -> dict:
     # Volatility (annualized)
     vol = float(returns.std() * np.sqrt(252))
 
-    # Beta vs SPY (cached 30 min)
+    # Beta vs SPY (with cache + retry)
     try:
-        spy_cached = cache_get("spy_returns")
-        if spy_cached is not None:
-            spy_ret = spy_cached
+        spy_ret = yf_spy_returns()
+        if spy_ret is not None:
+            aligned = returns.align(spy_ret, join="inner")
+            cov  = np.cov(aligned[0], aligned[1])
+            beta = float(cov[0, 1] / cov[1, 1])
         else:
-            spy = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
-            spy.columns = spy.columns.get_level_values(0)
-            spy_ret = spy["Close"].pct_change().dropna()
-            cache_set("spy_returns", spy_ret)
-        aligned = returns.align(spy_ret, join="inner")
-        cov  = np.cov(aligned[0], aligned[1])
-        beta = float(cov[0, 1] / cov[1, 1])
+            beta = 1.0
     except Exception:
         beta = 1.0
 
