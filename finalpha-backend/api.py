@@ -13,9 +13,29 @@ import requests as http_requests
 import os
 import uvicorn
 import logging
+import time
+from functools import lru_cache
+from threading import Lock
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finalpha")
+
+# ── Simple TTL Cache ────────────────────────────────────────────────────────
+_cache: dict = {}
+_cache_lock = Lock()
+CACHE_TTL = 15 * 60  # 15 นาที (วินาที)
+
+def cache_get(key: str):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.time() - entry["ts"] < CACHE_TTL:
+            logger.info(f"[CACHE HIT] {key}")
+            return entry["data"]
+    return None
+
+def cache_set(key: str, data):
+    with _cache_lock:
+        _cache[key] = {"data": data, "ts": time.time()}
 
 app = FastAPI(title="FinAlpha API", version="1.0.0")
 
@@ -82,6 +102,11 @@ def get_sentiment(texts: list[str]) -> dict:
 
 # ── Helper: Risk metrics ──────────────────────────────────────────────────────
 def calc_risk_metrics(ticker: str) -> dict:
+    # Check cache first
+    cached = cache_get(f"risk:{ticker}")
+    if cached:
+        return cached
+
     stock = yf.Ticker(ticker)
     hist  = stock.history(period="1y")
     logger.info(f"[{ticker}] history rows: {len(hist)}")
@@ -94,14 +119,19 @@ def calc_risk_metrics(ticker: str) -> dict:
     # Volatility (annualized)
     vol = float(returns.std() * np.sqrt(252))
 
-    # Beta vs SPY
+    # Beta vs SPY (cached 30 min)
     try:
-        spy     = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
-        spy.columns = spy.columns.get_level_values(0)
-        spy_ret = spy["Close"].pct_change().dropna()
+        spy_cached = cache_get("spy_returns")
+        if spy_cached is not None:
+            spy_ret = spy_cached
+        else:
+            spy = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
+            spy.columns = spy.columns.get_level_values(0)
+            spy_ret = spy["Close"].pct_change().dropna()
+            cache_set("spy_returns", spy_ret)
         aligned = returns.align(spy_ret, join="inner")
-        cov     = np.cov(aligned[0], aligned[1])
-        beta    = float(cov[0, 1] / cov[1, 1])
+        cov  = np.cov(aligned[0], aligned[1])
+        beta = float(cov[0, 1] / cov[1, 1])
     except Exception:
         beta = 1.0
 
@@ -142,7 +172,7 @@ def calc_risk_metrics(ticker: str) -> dict:
     price = float(hist["Close"].iloc[-1])
     total_return = float((hist["Close"].iloc[-1] / hist["Close"].iloc[0] - 1))
 
-    return {
+    result = {
         "ticker":       ticker.upper(),
         "price":        round(price, 2),
         "total_return": round(total_return * 100, 2),
@@ -155,6 +185,8 @@ def calc_risk_metrics(ticker: str) -> dict:
         "risk_score":   risk_score,
         "risk_label":   risk_label,
     }
+    cache_set(f"risk:{ticker}", result)
+    return result
 
 
 # ── Helper: Sentiment → recommendation text ───────────────────────────────────
