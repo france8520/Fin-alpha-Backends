@@ -12,6 +12,22 @@ import numpy as np
 import requests as http_requests
 import os
 import uvicorn
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("finalpha")
+
+# ── Custom session เพื่อหลีกเลี่ยง Yahoo Finance block cloud IPs ─────────────
+SESSION = http_requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+})
 
 app = FastAPI(title="FinAlpha API", version="1.0.0")
 
@@ -78,8 +94,9 @@ def get_sentiment(texts: list[str]) -> dict:
 
 # ── Helper: Risk metrics ──────────────────────────────────────────────────────
 def calc_risk_metrics(ticker: str) -> dict:
-    stock = yf.Ticker(ticker)
+    stock = yf.Ticker(ticker, session=SESSION)
     hist  = stock.history(period="1y")
+    logger.info(f"[{ticker}] history rows: {len(hist)}")
 
     if hist.empty or len(hist) < 20:
         raise ValueError(f"Insufficient data for {ticker}")
@@ -91,7 +108,7 @@ def calc_risk_metrics(ticker: str) -> dict:
 
     # Beta vs SPY
     try:
-        spy     = yf.download("SPY", period="1y", auto_adjust=True, progress=False)
+        spy     = yf.download("SPY", period="1y", auto_adjust=True, progress=False, session=SESSION)
         spy.columns = spy.columns.get_level_values(0)
         spy_ret = spy["Close"].pct_change().dropna()
         aligned = returns.align(spy_ret, join="inner")
@@ -189,7 +206,7 @@ def analyze(ticker: str):
         risk = calc_risk_metrics(ticker)
 
         # 2. News sentiment
-        stock  = yf.Ticker(ticker)
+        stock  = yf.Ticker(ticker, session=SESSION)
         news   = stock.news or []
         texts  = []
         for item in news:
@@ -213,8 +230,10 @@ def analyze(ticker: str):
         }
 
     except ValueError as e:
+        logger.error(f"[{ticker}] ValueError: {e}")
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        logger.error(f"[{ticker}] Exception: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
