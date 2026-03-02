@@ -4,3 +4,4 @@ yfinance>=0.2.43
 numpy==1.26.4
 scipy==1.13.1
 requests==2.31.0
+curl_cffi>=0.7.0
