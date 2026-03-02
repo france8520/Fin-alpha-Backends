@@ -334,8 +334,21 @@ def chart(ticker: str, period: str = "1y"):
         return cached
 
     try:
-        hist = yf_ticker_history(ticker, period=period)
-        if hist.empty or len(hist) < 5:
+        # Determine interval based on period
+        interval = "1d"
+        is_intraday = False
+        if period == "1d":
+            interval = "1m"
+            is_intraday = True
+        elif period == "1wk":
+            interval = "15m"
+            is_intraday = True
+
+        # yfinance history with interval
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period, interval=interval)
+        
+        if hist.empty or len(hist) < 2:
             raise ValueError(f"Insufficient data for {ticker}")
 
         close  = hist["Close"]
@@ -352,9 +365,14 @@ def chart(ticker: str, period: str = "1y"):
 
         rows = []
         for i, (idx, row) in enumerate(hist.iterrows()):
-            date_str = idx.strftime("%Y-%m-%d")
+            # lightweight-charts: intraday needs unix timestamp (int), daily needs 'YYYY-MM-DD'
+            if is_intraday:
+                date_val = int(idx.timestamp())
+            else:
+                date_val = idx.strftime("%Y-%m-%d")
+
             rows.append({
-                "date":       date_str,
+                "date":       date_val,
                 "open":       round(float(row["Open"]),  4),
                 "high":       round(float(row["High"]),  4),
                 "low":        round(float(row["Low"]),   4),
