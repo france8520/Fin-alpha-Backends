@@ -15,6 +15,7 @@ import os
 import uvicorn
 import logging
 import time
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from threading import Lock
@@ -91,6 +92,11 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# ── Chat Request Model ────────────────────────────────────────────────────────
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict] = []  # [{"role": "user"/"assistant", "content": "..."}]
 
 # ── API Keys & Models ─────────────────────────────────────────────────────────
 HF_API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
@@ -272,6 +278,92 @@ def analyze(ticker: str):
     except Exception as e:
         logger.error(f"[{ticker}] Exception: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+# ── Helper: extract ticker from free-text ────────────────────────────────────
+_EXCLUDE_WORDS = {
+    "A", "I", "AN", "THE", "IS", "ARE", "FOR", "IN", "ON", "AT",
+    "TO", "OF", "US", "UK", "EU", "AI", "OR", "AND", "NOT", "IF",
+    "BUY", "SELL", "NOW", "GET", "HAS", "CAN", "ANY", "NEW",
+}
+
+def extract_ticker(text: str) -> str | None:
+    """ดึง stock ticker จาก free-text เช่น 'analyze NVDA' หรือ '$TSLA'"""
+    # ลอง $TICKER ก่อน (ชัดเจนที่สุด)
+    dollar = re.findall(r'\$([A-Z]{1,5})\b', text.upper())
+    if dollar:
+        return dollar[0]
+    # ลอง คำ uppercase 2-5 ตัว
+    words = re.findall(r'\b([A-Z]{2,5})\b', text.upper())
+    for w in words:
+        if w not in _EXCLUDE_WORDS:
+            return w
+    return None
+
+# ── Endpoint: Conversational Chat ─────────────────────────────────────────────
+@app.post("/chat")
+def chat(req: ChatRequest):
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="Chat unavailable: GROQ_API_KEY not set")
+
+    client = Groq(api_key=GROQ_API_KEY)
+    message = req.message.strip()
+
+    # ── ถ้าเจอ ticker ใน message → ดึงข้อมูลจริงมาใส่ context ─────────────────
+    ticker = extract_ticker(message)
+    stock_context = ""
+    if ticker:
+        try:
+            risk = calc_risk_metrics(ticker)
+            stock_context = (
+                f"\n\n[Live data — {ticker}] "
+                f"Price: ${risk['price']} | "
+                f"Return (1y): {risk['total_return']}% | "
+                f"Volatility: {risk['vol']} | "
+                f"Beta: {risk['beta']} | "
+                f"Sharpe: {risk['sharpe']} | "
+                f"RSI: {risk['rsi']} | "
+                f"Risk: {risk['risk_label']} (score {risk['risk_score']}/100)"
+            )
+            logger.info(f"[Chat] Injected live data for {ticker}")
+        except Exception as e:
+            logger.warning(f"[Chat] Could not fetch data for {ticker}: {e}")
+
+    # ── System prompt ─────────────────────────────────────────────────────────
+    system_prompt = (
+        "You are Fin-Alpha, a smart and friendly financial assistant. You help users with:\n"
+        "- Stock analysis, market trends, and investment ideas\n"
+        "- Explaining financial concepts simply (P/E ratio, beta, RSI, etc.)\n"
+        "- General investment strategies (DCA, diversification, risk management)\n"
+        "- Answering open-ended questions about markets and economy\n\n"
+        "When live stock data is provided in brackets, use it to give accurate, data-backed answers.\n"
+        "Be concise, helpful, and natural — not robotic. "
+        "Respond in the same language the user writes in (Thai or English)."
+        + stock_context
+    )
+
+    # ── Build message list (keep last 6 turns = 3 rounds) ────────────────────
+    messages = [{"role": "system", "content": system_prompt}]
+    messages += req.history[-6:]
+    messages.append({"role": "user", "content": message})
+
+    try:
+        resp = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=500,
+        )
+        reply = resp.choices[0].message.content.strip()
+        logger.info(f"[Chat] replied (ticker={ticker or 'none'})")
+        return {
+            "reply": reply,
+            "ticker_detected": ticker,
+            "stock_data": risk if ticker and stock_context else None,
+        }
+    except Exception as e:
+        logger.error(f"[Chat] Groq error: {e}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
 
 if __name__ == "__main__":
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
