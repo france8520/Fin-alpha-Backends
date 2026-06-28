@@ -279,6 +279,45 @@ def analyze(ticker: str):
         logger.error(f"[{ticker}] Exception: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
+@app.get("/chart/{ticker}")
+def chart(ticker: str, period: str = "1y"):
+    ticker = ticker.strip().upper()
+    if not ticker or len(ticker) > 10:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    valid_periods = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"}
+    if period not in valid_periods:
+        period = "1y"
+    try:
+        hist = yf_ticker_history(ticker, period=period)
+        if hist.empty:
+            raise ValueError(f"No data for {ticker}")
+        closes = hist["Close"]
+        data_points = [
+            {"date": idx.strftime("%Y-%m-%d"), "close": round(float(val), 2)}
+            for idx, val in closes.items()
+            if not np.isnan(val)
+        ]
+        current_price = float(closes.iloc[-1])
+        first_price = float(closes.iloc[0])
+        change_pct = round((current_price / first_price - 1) * 100, 2)
+        high_52w = round(float(closes.max()), 2)
+        low_52w = round(float(closes.min()), 2)
+        avg_volume = int(hist["Volume"].mean()) if "Volume" in hist.columns else 0
+        return {
+            "ticker": ticker,
+            "current_price": round(current_price, 2),
+            "change_pct": change_pct,
+            "high_52w": high_52w,
+            "low_52w": low_52w,
+            "avg_volume": avg_volume,
+            "data": data_points,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"[Chart {ticker}] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Chart failed: {str(e)}")
+
 # ── Helper: extract ticker from free-text ────────────────────────────────────
 _EXCLUDE_WORDS = {
     "A", "I", "AN", "THE", "IS", "ARE", "FOR", "IN", "ON", "AT",
